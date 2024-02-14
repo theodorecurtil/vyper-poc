@@ -78,12 +78,22 @@ ORACLES_PRECISIONS: constant(uint256[N_COINS]) = [
 
 uniswap_swap_router: public(SwapRouter)
 owner: public(address)
+policy_weights: public(uint256[N_COINS])
 
+
+###########################################################################################
+# ETF CONTRACT
+###########################################################################################
 
 @external
 def __init__():
     self.owner = msg.sender
     self.uniswap_swap_router = SwapRouter(UNISWAP_ROUTER)
+    self.policy_weights = COINS_WEIGHT
+
+###########################################################################################
+# INTERNAL FUNCTIONS
+###########################################################################################
 
 @internal
 @view
@@ -96,6 +106,21 @@ def _get_amount_out_min(quantity_in: uint256, i: int128) -> uint256:
     return 10 ** 18 * NUMERAIRE_PRECISION * quantity_in / self._get_underlying_spot_price(i) / COINS_PRECISIONS[i]
 
 @internal
+@view
+def _get_nav_token(i: int128) -> uint256:
+    return self._get_underlying_spot_price(i) * COINS_PRECISIONS[i] * ERC20(ETF_COINS[i]).balanceOf(self) / 10 ** 18 / NUMERAIRE_PRECISION
+
+@internal
+@view
+def _get_nav() -> uint256:
+    nav: uint256 = ERC20(NUMERAIRE).balanceOf(self)
+    for i in range(N_COINS):
+        nav += self._get_nav_token(i)
+
+    return nav
+
+
+@internal
 def _swap_exact_input_single(tokenIn: address, tokenOut: address, amountIn: uint256, amountOutMin: uint256) -> uint256:
     
     # Approve for uni rooter to spend the tokenIn
@@ -106,7 +131,7 @@ def _swap_exact_input_single(tokenIn: address, tokenOut: address, amountIn: uint
         tokenIn,
         tokenOut,
         POOL_FEE,
-        msg.sender,
+        self,
         block.timestamp,
         amountIn,
         amountOutMin,
@@ -116,6 +141,29 @@ def _swap_exact_input_single(tokenIn: address, tokenOut: address, amountIn: uint
     log Swap(tokenIn, tokenOut, amountIn, amountOut)
 
     return amountOut
+
+@internal
+def _swap_exact_output_single(tokenIn: address, tokenOut: address, amountOut: uint256, amountInMaximum: uint256) -> uint256:
+    
+    # Approve for uni router to spend the tokenIn
+    ERC20(tokenIn).approve(UNISWAP_ROUTER, amountInMaximum)
+
+    # make the swap
+    amountIn: uint256 = self.uniswap_swap_router.exactOutputSingle((
+        tokenIn,
+        tokenOut,
+        POOL_FEE,
+        self,
+        block.timestamp,
+        amountOut,
+        amountInMaximum,
+        convert(0, uint160)
+    ))
+
+    log Swap(tokenIn, tokenOut, amountIn, amountOut)
+
+    return amountIn
+
 
 
 ###########################################################################################
@@ -134,7 +182,7 @@ def get_underlying_spot_price(i: int128) -> uint256:
 @external
 def swapExactInputSingle(tokenIn: address, tokenOut: address, amountIn: uint256, amountOutMin: uint256) -> uint256:
     """
-    @notice Swap with uniswap router
+    @notice NOT SAFE JUST FOR TESTS - Swap with uniswap router
     @param amountIn amount of token to swap (the amount that the user sends to the AMM)
     """
 
@@ -145,35 +193,22 @@ def swapExactInputSingle(tokenIn: address, tokenOut: address, amountIn: uint256,
 @external
 def swapExactOutputSingle(tokenIn: address, tokenOut: address, amountOut: uint256, amountInMaximum: uint256) -> uint256:
     """
-    @notice swapExactOutputSingle swaps a minimum possible amount of tokenIn for a fixed amount of tokenOut.
+    @notice NOT SAFE JUST FOR TESTS - swapExactOutputSingle swaps a minimum possible amount of tokenIn for a fixed amount of tokenOut.
     @dev The calling address must approve this contract to spend its tokenIn for this function to succeed. As the amount of input tokenIn is variable, 
     the calling address will need to approve for a slightly higher amount, anticipating some variance.
     @param amountOut The exact amount of tokenOut to receive from the swap.
     @param amountInMaximum The amount of tokenIn we are willing to spend to receive the specified amount of tokenOut.
     @return amountIn The amount of tokenIn actually spent in the swap.
     """
-    # msg.sender must approve the contract to spend tokenIn
-    assert ERC20(tokenIn).allowance(msg.sender, self) >= amountInMaximum, "Allowance insufficient"
 
-    # Transfer the specified amount of tokenIn to this contract.
+    # Transfer the maximum amount of tokenIn to this contract.
     ERC20(tokenIn).transferFrom(msg.sender, self, amountInMaximum)
-    ERC20(tokenIn).approve(UNISWAP_ROUTER, amountInMaximum)
+    
+    amountIn: uint256 = self._swap_exact_output_single(tokenIn, tokenOut, amountOut, amountInMaximum)
 
-    # make the swap
-    amountIn: uint256 = self.uniswap_swap_router.exactOutputSingle((
-        tokenIn,
-        tokenOut,
-        POOL_FEE,
-        msg.sender,
-        block.timestamp,
-        amountOut,
-        amountInMaximum,
-        convert(0, uint160)
-    ))
     # For exact output swaps, the amountInMaximum may not have all been spent.
     # If the actual amount spent (amountIn) is less than the specified maximum amount, we must refund the msg.sender and approve the swapRouter to spend 0.
     if amountIn < amountInMaximum:
-        # ERC20(USDC).approve(UNISWAP_ROUTER, 0)
         ERC20(tokenIn).transfer(msg.sender, amountInMaximum - amountIn)
 
     return amountIn
@@ -207,3 +242,43 @@ def flush_tokens(recipient: address):
         # transfer the balance to recipient
         token_balance: uint256 = ERC20(ETF_COINS[i]).balanceOf(self)
         ERC20(ETF_COINS[i]).transfer(recipient, token_balance)
+
+    numeraire_balance: uint256 = ERC20(NUMERAIRE).balanceOf(self)
+    ERC20(NUMERAIRE).transfer(recipient, numeraire_balance)
+
+@external
+@view
+def get_nav() -> uint256:
+    """
+    @notice Return the current NAV of the ETF, expressed in units of numeraire
+    """
+    return self._get_nav()
+
+@external
+@view
+def get_nav_token(i: int128) -> uint256:
+    """
+    @notice Return the NAV of the token at index i in ETF
+    """
+    return self._get_nav_token(i)
+
+@external
+@view
+def get_effective_weights() -> uint256[N_COINS]:
+    """
+    @dev To not multiply calls to the oracles, compute NAV token by token
+    """
+    nav: uint256 = 0
+    nav_tokens: uint256[N_COINS] = empty(uint256[N_COINS])
+    for i in range(N_COINS):
+        nav_tokens[i] = self._get_nav_token(i)
+        nav += nav_tokens[i]
+
+    effective_weights: uint256[N_COINS] = empty(uint256[N_COINS])
+    if nav == 0:
+        return effective_weights
+
+    for i in range(N_COINS):
+        effective_weights[i] = 10 ** 18 * nav_tokens[i] / nav
+
+    return effective_weights

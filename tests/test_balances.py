@@ -1,8 +1,5 @@
 #!/usr/bin/python3
 
-import pytest
-
-
 def test_owner_has_zero_wbtc(wbtc, owner):
     assert wbtc.balanceOf(owner) == 0 * 10 ** 8
 
