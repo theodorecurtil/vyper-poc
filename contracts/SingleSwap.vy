@@ -39,15 +39,18 @@ interface ChainlinkPriceOracle:
 
 ## ETF
 
-N_COINS: constant(int128) = 1   # number of coins in ETF
+N_COINS: constant(int128) = 2                       # number of coins in ETF
 ETF_COINS: constant(address[N_COINS]) = [
-    0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
+    0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,     # WBTC
+    0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,     # WETH
 ]
 COINS_PRECISIONS: constant(uint256[N_COINS]) = [
     10000000000,
+    1,
 ]
 COINS_WEIGHT: constant(uint256[N_COINS]) = [
-    1000000000000000000
+    500000000000000000,
+    500000000000000000,
 ]
 PRECISION_WEIGHT: constant(uint256) = 1
 
@@ -67,10 +70,12 @@ UNISWAP_ROUTER: constant(address) = 0xE592427A0AEce92De3Edee1F18E0157C05861564
 
 ## CHAINLINK ORACLES
 CHAINLINK_ORACLES: constant(address[N_COINS]) = [
-    0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c
+    0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c,
+    0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419,
     ]
 ORACLES_PRECISIONS: constant(uint256[N_COINS]) = [
-    10000000000
+    10000000000,
+    10000000000,
 ]
 
 
@@ -118,6 +123,27 @@ def _get_nav() -> uint256:
         nav += self._get_nav_token(i)
 
     return nav
+
+@internal
+@view
+def _get_effective_weights() -> uint256[N_COINS]:
+    """
+    @dev To not multiply calls to the oracles, compute NAV token by token
+    """
+    nav: uint256 = 0
+    nav_tokens: uint256[N_COINS] = empty(uint256[N_COINS])
+    for i in range(N_COINS):
+        nav_tokens[i] = self._get_nav_token(i)
+        nav += nav_tokens[i]
+
+    effective_weights: uint256[N_COINS] = empty(uint256[N_COINS])
+    if nav == 0:
+        return effective_weights
+
+    for i in range(N_COINS):
+        effective_weights[i] = 10 ** 18 * nav_tokens[i] / nav
+
+    return effective_weights
 
 
 @internal
@@ -226,7 +252,7 @@ def deposit_numeraire(quantity: uint256):
 
     # compute and swap respecting etf weights
     for i in range(N_COINS):
-        numeraire_to_swap: uint256 = PRECISION_WEIGHT * COINS_WEIGHT[i] * quantity / 10 ** 18
+        numeraire_to_swap: uint256 = PRECISION_WEIGHT * self.policy_weights[i] * quantity / 10 ** 18
         # compute amount out min from oracle's price, 2.5% lower
         amountOutMin: uint256 = 975 * 10 ** 15 * self._get_amount_out_min(numeraire_to_swap, i) / 10 ** 18
         self._swap_exact_input_single(NUMERAIRE, ETF_COINS[i], numeraire_to_swap, amountOutMin)
@@ -258,7 +284,7 @@ def get_nav() -> uint256:
 @view
 def get_nav_token(i: int128) -> uint256:
     """
-    @notice Return the NAV of the token at index i in ETF
+    @notice Return the NAV of the token at index i in ETF, in units of numeraire
     """
     return self._get_nav_token(i)
 
@@ -268,17 +294,60 @@ def get_effective_weights() -> uint256[N_COINS]:
     """
     @dev To not multiply calls to the oracles, compute NAV token by token
     """
-    nav: uint256 = 0
-    nav_tokens: uint256[N_COINS] = empty(uint256[N_COINS])
+    return self._get_effective_weights()
+
+@external
+def rebalance():
+    # Compute effective weights
+    effective_weights: uint256[N_COINS] = self._get_effective_weights()
+
+    # Compute delta weights
+    delta_weights: uint256[N_COINS] = empty(uint256[N_COINS])
+    is_delta_positive: bool[N_COINS] = empty(bool[N_COINS])
     for i in range(N_COINS):
-        nav_tokens[i] = self._get_nav_token(i)
-        nav += nav_tokens[i]
+        if effective_weights[i] > self.policy_weights[i]:
+            delta_weights[i] = effective_weights[i] - self.policy_weights[i]
+            is_delta_positive[i] = True
+            # Sell the token
+            units_to_sell: uint256 = ERC20(ETF_COINS[i]).balanceOf(self) * delta_weights[i] / effective_weights[i]
+            # Get min amount of numeraire
+            min_amount_numeraire_out: uint256 = 975 * 10**15 * COINS_PRECISIONS[i] * units_to_sell * self._get_underlying_spot_price(i) / 10**18 / NUMERAIRE_PRECISION / 10**18
+            self._swap_exact_input_single(ETF_COINS[i], NUMERAIRE, units_to_sell, min_amount_numeraire_out)
 
-    effective_weights: uint256[N_COINS] = empty(uint256[N_COINS])
-    if nav == 0:
-        return effective_weights
+        else:
+            delta_weights[i] = self.policy_weights[i] - effective_weights[i]
+            is_delta_positive[i] = False
 
+    # Now do the buys
+    max_amount_numeraire_in: uint256 = 0
     for i in range(N_COINS):
-        effective_weights[i] = 10 ** 18 * nav_tokens[i] / nav
+        if is_delta_positive[i]:
+            continue
+        units_to_buy: uint256 = ERC20(ETF_COINS[i]).balanceOf(self) * delta_weights[i] / effective_weights[i]
+        numeraire_to_sell: uint256 = COINS_PRECISIONS[i] * units_to_buy * self._get_underlying_spot_price(i) / 10**18 / NUMERAIRE_PRECISION
+        if numeraire_to_sell > ERC20(NUMERAIRE).balanceOf(self):
+            numeraire_to_sell = ERC20(NUMERAIRE).balanceOf(self)
+        amountOutMin: uint256 = 975 * 10 ** 15 * self._get_amount_out_min(numeraire_to_sell, i) / 10 ** 18
+        self._swap_exact_input_single(NUMERAIRE, ETF_COINS[i], numeraire_to_sell, amountOutMin)
 
-    return effective_weights
+    
+@external
+def set_policy_weights(new_weights: uint256[N_COINS]):
+    assert msg.sender == self.owner # dev: only owner can change policy weights
+    sum_weights: uint256 = 0
+    for weight in new_weights:
+        # check weight is greater than 1%
+        assert weight >= 10 ** 16
+        assert weight < 10 ** 18
+        sum_weights += weight
+
+    # normalize weights to 10 ** 18
+    sum_new_weights: uint256 = 0
+    for i in range(N_COINS):
+        self.policy_weights[i] = 10**18 * new_weights[i] / sum_weights
+        sum_new_weights += self.policy_weights[i]
+    
+    # distribute remaining
+    diff: uint256 = 10 ** 18 - sum_new_weights
+    if diff > 0:
+        self.policy_weights[0] += diff

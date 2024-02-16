@@ -40,5 +40,5 @@ def test_nav_single_token(single_swap, usdc, owner):
     usdc_amount = usdc.balanceOf(owner)
     usdc.approve(single_swap, usdc_amount, sender=owner)
     single_swap.deposit_numeraire(usdc_amount, sender=owner)
-    assert single_swap.get_nav_token(0) > 0.95 * usdc_amount, f"NAV too small ({single_swap.get_nav()})"
-    assert single_swap.get_nav_token(0) < 1.05 * usdc_amount, f"NAV too large ({single_swap.get_nav()})"
+    assert single_swap.get_nav_token(0) > 0.95 * usdc_amount / 2, f"NAV too small ({single_swap.get_nav_token(0)})"
+    assert single_swap.get_nav_token(0) < 1.05 * usdc_amount / 2, f"NAV too large ({single_swap.get_nav_token(0)})"
