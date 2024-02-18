@@ -106,3 +106,27 @@ def test_deposit_usdc_and_flush(owner, single_swap, usdc, wbtc, receiver):
     assert usdc.balanceOf(single_swap) == 0
     assert usdc.balanceOf(receiver) > 0
     assert wbtc.balanceOf(receiver) > 0
+
+def test_withdraw_to_numeraire(single_swap, owner, receiver, usdc, wbtc):
+    # owner initial amount usdc
+    initial_usdc_amount = usdc.balanceOf(owner)
+
+    # Deposit $5k USDC and send the other $5k to SC. Then flush
+    amount_to_deposit = usdc.balanceOf(owner) // 2
+    usdc.approve(single_swap, amount_to_deposit, sender=owner)
+    single_swap.deposit_numeraire(amount_to_deposit, sender=owner)
+    # Send the remaining to SC
+    usdc.transfer(single_swap, usdc.balanceOf(owner), sender=owner)
+    assert usdc.balanceOf(owner) == 0
+    assert wbtc.balanceOf(single_swap) > 0
+    assert usdc.balanceOf(single_swap) > 0
+
+    # Withdraw
+    single_swap.withdraw_numeraire_all(receiver, sender=owner)
+    assert wbtc.balanceOf(single_swap) == 0
+    assert usdc.balanceOf(single_swap) == 0
+    assert usdc.balanceOf(receiver) > 0
+    assert wbtc.balanceOf(receiver) == 0
+    assert usdc.balanceOf(receiver) > 0.95 * initial_usdc_amount
+    assert usdc.balanceOf(receiver) < 1.05 * initial_usdc_amount
+    
